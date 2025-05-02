@@ -221,9 +221,9 @@ def main():
     # Global policy recurrent layer size
     g_hidden_size = args.global_hidden_size    #把全局策略中RNN的隐藏层大小/维度（隐藏层中神经元的个数）赋值给变量 g_hidden_size  ##
 
-    # Semantic Mapping
-    sem_map_module = Semantic_Mapping(args).to(device)
-    sem_map_module.eval()
+    # Semantic Mapping   ### 根据智能体的感知结果（图像等），构建出具有语义标签的地图
+    sem_map_module = Semantic_Mapping(args).to(device) #创建一个语义地图构建器的实例，args 传入了参数（如类别数、分辨率等）
+    sem_map_module.eval()  #进入评估模式
 
     # Global policy
     g_policy = RL_Policy(g_observation_space.shape, g_action_space,
