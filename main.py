@@ -18,72 +18,72 @@ os.environ["OMP_NUM_THREADS"] = "1"
 
 
 def main():
-    args = get_args()
+    args = get_args() #解析命令行参数，也就是args变成了一个包含各种参数的对象，比如args.seed, args.device等等
 
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
+    np.random.seed(args.seed) #设置NumPy的随机种子，确保所有使用NumPy生成的随机数都可以复现
+    torch.manual_seed(args.seed) #设置CPU端的随机种子
 
-    if args.cuda:
-        torch.cuda.manual_seed(args.seed)
+    if args.cuda: #如果启动了CUDA（即使用GPU进行计算）
+        torch.cuda.manual_seed(args.seed) #设置GPU的随机种子
 
     # Setup Logging
-    log_dir = "{}/models/{}/".format(args.dump_location, args.exp_name)
-    dump_dir = "{}/dump/{}/".format(args.dump_location, args.exp_name)
+    log_dir = "{}/models/{}/".format(args.dump_location, args.exp_name) #生成模型保存路径，这个目录就是用来保存训练过程中生成的模型文件（.pth）或 checkpoints 的。
+    dump_dir = "{}/dump/{}/".format(args.dump_location, args.exp_name) #生成运行日志或中间结果保存路径
 
-    if not os.path.exists(log_dir):
-        os.makedirs(log_dir)
+    if not os.path.exists(log_dir):  #检查上面的log_dir 和dump_dir路径是否存在，如果不存在就自动创建 
+        os.makedirs(log_dir)  
     if not os.path.exists(dump_dir):
-        os.makedirs(dump_dir)
+        os.makedirs(dump_dir) 
 
-    logging.basicConfig(
+    logging.basicConfig(  #配置了 Python 的内置 logging 模块，用来将日志信息写入文件
         filename=log_dir + 'train.log',
         level=logging.INFO)
-    print("Dumping at {}".format(log_dir))
-    print(args)
-    logging.info(args)
+    print("Dumping at {}".format(log_dir)) #把保存路径打印出来，方便你知道模型/log 会存在哪里
+    print(args) #输出参数配置，方便知道种子、学习率等等
+    logging.info(args) #同时把参数写进日志文件里
 
     # Logging and loss variables
-    num_scenes = args.num_processes
-    num_episodes = int(args.num_eval_episodes)
-    device = args.device = torch.device("cuda:0" if args.cuda else "cpu")
+    num_scenes = args.num_processes  #并发环境数量等于使用等进程数，每个进程负责跑一部分 episode（比如第 0 个进程跑第 0~49 个 episode）
+    num_episodes = int(args.num_eval_episodes) #评估时要执行的 episode 数量
+    device = args.device = torch.device("cuda:0" if args.cuda else "cpu") #使用 GPU 还是 CPU 进行训练，赋值为 cuda:0 或 cpu
 
-    g_masks = torch.ones(num_scenes).float().to(device)
+    g_masks = torch.ones(num_scenes).float().to(device) # 表示创建一个长度为num_scenes，值都为1的张量，数据类型为float32,并把这个张量移动到指定的设备上，比如 CPU 或 GPU。
 
-    best_g_reward = -np.inf
+    best_g_reward = -np.inf #赋值为负无穷，用于保存最好的全局reward
 
-    if args.eval:
+    if args.eval: #如果是评估模式，这里关心具体的进程，因为不同的进程可能是在不同的场景下跑的（如厨房，卧室、浴室）
         episode_success = []
         episode_spl = []
         episode_dist = []
-        for _ in range(args.num_processes):
-            episode_success.append(deque(maxlen=num_episodes))
-            episode_spl.append(deque(maxlen=num_episodes))
-            episode_dist.append(deque(maxlen=num_episodes))
+        for _ in range(args.num_processes): #这里下划线跟i是一样的，不过这里你不关心它的值
+            episode_success.append(deque(maxlen=num_episodes)) #在episode_success这个列表里添加一个最大长度为num_episodes的双端队列（deque是语法），这里一个列表最终添加了args.num_processes（进程数）个双端队列
+            episode_spl.append(deque(maxlen=num_episodes))  #也就是一个列表里最后有进程数个双端队列
+            episode_dist.append(deque(maxlen=num_episodes)) #记录 agent 与目标的最终距离
 
-    else:
+    else: #如果不是评估模式（即训练模式下），就使用全局deque, 只关心总体趋势（如成功率是否上升）
         episode_success = deque(maxlen=1000)
         episode_spl = deque(maxlen=1000)
         episode_dist = deque(maxlen=1000)
 
-    finished = np.zeros((args.num_processes))
-    wait_env = np.zeros((args.num_processes))
+    finished = np.zeros((args.num_processes)) #记录每个进程的 episode 是否完成
+    wait_env = np.zeros((args.num_processes)) #可能用于统计环境是否在等待某些操作（比如数据加载）
 
-    g_episode_rewards = deque(maxlen=1000)
+    g_episode_rewards = deque(maxlen=1000) #每个episode总的reward
 
-    g_value_losses = deque(maxlen=1000)
-    g_action_losses = deque(maxlen=1000)
-    g_dist_entropies = deque(maxlen=1000)
+    g_value_losses = deque(maxlen=1000) #值函数的loss
+    g_action_losses = deque(maxlen=1000) #策略/动作函数的loss
+    g_dist_entropies = deque(maxlen=1000) #策略分布的熵（用于鼓励探索）
 
-    per_step_g_rewards = deque(maxlen=1000)
+    per_step_g_rewards = deque(maxlen=1000) #每一步的reward
 
-    g_process_rewards = np.zeros((num_scenes))
+    g_process_rewards = np.zeros((num_scenes)) #每个并发环境的rewards，用于更新
 
-    # Starting environments
-    torch.set_num_threads(1)
-    envs = make_vec_envs(args)
-    obs, infos = envs.reset()
+    # Starting environments 
+    torch.set_num_threads(1) #只用一个线程（不是进程）来执行CPU运算
+    envs = make_vec_envs(args) #创建一个并行环境容器，即多个环境实例组成的向量   ######并行环境容器：可以同时运行多个仿真环境，并像一个大环境一样控制它们 #####如 envs.reset()就是一次性重制所有环境  envs.step(action)就是给每个环境执行一个动作，所有环境都执行一步
+    obs, infos = envs.reset() #obs是智能体看到的所有并行环境的初始观测，通常是图像（RGB/RGB-D张量等等）或者状态向量（坐标、角度等等） #### infos是一些环境返回的额外信息
 
-    torch.set_grad_enabled(False)
+    torch.set_grad_enabled(False) #关闭梯度计算，用于评估模式或无训练阶段
 
     # Initialize map variables:
     # Full map consists of multiple channels containing the following:
@@ -92,43 +92,43 @@ def main():
     # 3. Current Agent Location
     # 4. Past Agent Locations
     # 5,6,7,.. : Semantic Categories
-    nc = args.num_sem_categories + 4  # num channels
+    nc = args.num_sem_categories + 4  # num channels ####这里好像有一个问题，论文里是n+2个channel(obstacle map and explored area)
 
     # Calculating full and local map sizes
-    map_size = args.map_size_cm // args.map_resolution
+    map_size = args.map_size_cm // args.map_resolution  #地图边长整除每一个格子的边长，这个地图有map_size * map_size 格
     full_w, full_h = map_size, map_size
-    local_w = int(full_w / args.global_downscaling)
-    local_h = int(full_h / args.global_downscaling)
+    local_w = int(full_w / args.global_downscaling)  #args.global_downscaling 是缩放比例，得到局部语义地图的边长数  #####局部语义地图是为了让智能体专注于当前可行走的局部区域
+    local_h = int(full_h / args.global_downscaling) 
 
     # Initializing full and local map
-    full_map = torch.zeros(num_scenes, nc, full_w, full_h).float().to(device)
+    full_map = torch.zeros(num_scenes, nc, full_w, full_h).float().to(device) #创建一个全局地图张量,形状是[num_scenes, nc, full_w, full_h] ### num_scenes：并发的环境/进程数量（每个环境一个地图）nc:channel数
     local_map = torch.zeros(num_scenes, nc, local_w,
-                            local_h).float().to(device)
+                            local_h).float().to(device)  #同理，创建一个局部地图张量
 
     # Initial full and local pose
-    full_pose = torch.zeros(num_scenes, 3).float().to(device)
-    local_pose = torch.zeros(num_scenes, 3).float().to(device)
+    full_pose = torch.zeros(num_scenes, 3).float().to(device)   #创建全局位姿张量, 形状是(num_scenes, 3) ###num_scenes： 并发环境/进程数量/agent数量（每个并发环境中有一个agent）, 3表示每个agent的位姿由x,y,θ组成
+    local_pose = torch.zeros(num_scenes, 3).float().to(device) # 创建局部位姿张量，用于局部规划，避障
 
     # Origin of local map
-    origins = np.zeros((num_scenes, 3))
+    origins = np.zeros((num_scenes, 3)) #创建一个局部地图原点的数组，形状是[num_scenes, 3] 每一行记录一个agent的局部地图原点在全局地图中的坐标和朝向
 
     # Local Map Boundaries
-    lmb = np.zeros((num_scenes, 4)).astype(int)
+    lmb = np.zeros((num_scenes, 4)).astype(int) #一个数组，每一行记录局部地图的上下左右边界索引在全局地图中的位置，astype(int)是将边界从float类型转化为int类型
 
     # Planner pose inputs has 7 dimensions
     # 1-3 store continuous global agent location
     # 4-7 store local map boundaries
-    planner_pose_inputs = np.zeros((num_scenes, 7))
+    planner_pose_inputs = np.zeros((num_scenes, 7))。#其实就是合并了上面的origins和lmp数组，这个是专门为路径规划模块准备的
 
-    def get_local_map_boundaries(agent_loc, local_sizes, full_sizes):
+    def get_local_map_boundaries(agent_loc, local_sizes, full_sizes):  #根据机器人当前位置，从全局语义地图中裁剪出局部地图 （上下左右边界）
         loc_r, loc_c = agent_loc
-        local_w, local_h = local_sizes
+        local_w, local_h = local_sizes     ######   这里的三行为拆解数据
         full_w, full_h = full_sizes
 
-        if args.global_downscaling > 1:
-            gx1, gy1 = loc_r - local_w // 2, loc_c - local_h // 2
-            gx2, gy2 = gx1 + local_w, gy1 + local_h
-            if gx1 < 0:
+        if args.global_downscaling > 1:   #如果需要缩放
+            gx1, gy1 = loc_r - local_w // 2, loc_c - local_h // 2   #这里的局部窗口是以agent的坐标为中心，计算出左上角点的坐标
+            gx2, gy2 = gx1 + local_w, gy1 + local_h                #根据左上角的坐标计算出右下角的坐标
+            if gx1 < 0:                                   #### 以下这四个if是为了保证局部边界不超出地图范围
                 gx1, gx2 = 0, local_w
             if gx2 > full_w:
                 gx1, gx2 = full_w - local_w, full_w
@@ -137,41 +137,41 @@ def main():
                 gy1, gy2 = 0, local_h
             if gy2 > full_h:
                 gy1, gy2 = full_h - local_h, full_h
-        else:
+        else:    #正常实验肯定是args,global_downscaling大于1的，这里加了不缩放的情况是要跑一个baseline或ablation实验，
             gx1, gx2, gy1, gy2 = 0, full_w, 0, full_h
 
-        return [gx1, gx2, gy1, gy2]
+        return [gx1, gx2, gy1, gy2] #返回左上角点和右下角点的坐标，注意顺序
 
     def init_map_and_pose():
-        full_map.fill_(0.)
-        full_pose.fill_(0.)
-        full_pose[:, :2] = args.map_size_cm / 100.0 / 2.0
+        full_map.fill_(0.)   #将地图中所有值设置为0，
+        full_pose.fill_(0.)  #将位姿都设为0
+        full_pose[:, :2] = args.map_size_cm / 100.0 / 2.0  #将Agent的初始位置设置在地图的中心（单位m） ##full_pose的形状为[num_scenes, 3], 这里的full_pose[:, :2]表示所有scene只取前面两个维度
 
-        locs = full_pose.cpu().numpy()
-        planner_pose_inputs[:, :3] = locs
+        locs = full_pose.cpu().numpy()   #把full_pose从张量转化numpy ###这里.cpu()是把这个张量转化到CPU上，因为PyTorch不允许GPU张量直接变成NumPy数组
+        planner_pose_inputs[:, :3] = locs 
         for e in range(num_scenes):
             r, c = locs[e, 1], locs[e, 0]
-            loc_r, loc_c = [int(r * 100.0 / args.map_resolution),
-                            int(c * 100.0 / args.map_resolution)]
+            loc_r, loc_c = [int(r * 100.0 / args.map_resolution),  #把米单位的坐标转化为地图像素单位（格）: 为的是方便把数据存储在数组里（下标调用）
+                            int(c * 100.0 / args.map_resolution)]  #args.map_resolution表示地图中的一格（一个像素）代表现实中的多少cm
 
-            full_map[e, 2:4, loc_r - 1:loc_r + 2, loc_c - 1:loc_c + 2] = 1.0
+            full_map[e, 2:4, loc_r - 1:loc_r + 2, loc_c - 1:loc_c + 2] = 1.0   #在全局地图的通道2（explored area）和通道3 (current agent location)上,以当前位置为中心，画一个3*3的小标记块，表示当前agent的位置
 
-            lmb[e] = get_local_map_boundaries((loc_r, loc_c),
+            lmb[e] = get_local_map_boundaries((loc_r, loc_c),      #lmb记录的就是gx1, gx2, gy1, gy2
                                               (local_w, local_h),
                                               (full_w, full_h))
 
             planner_pose_inputs[e, 3:] = lmb[e]
-            origins[e] = [lmb[e][2] * args.map_resolution / 100.0,
-                          lmb[e][0] * args.map_resolution / 100.0, 0.]
+            origins[e] = [lmb[e][2] * args.map_resolution / 100.0,           #把局部地图的左上角设置为原点 （这张局部地图是以agent为中心裁的）
+                          lmb[e][0] * args.map_resolution / 100.0, 0.]      #即 origins[e] = gx1, gy1
 
         for e in range(num_scenes):
-            local_map[e] = full_map[e, :,
-                                    lmb[e, 0]:lmb[e, 1],
+            local_map[e] = full_map[e, :,                   #从 full_map 中裁剪一块 agent 附近的区域（大小为 local_w × local_h），赋值给 local_map。
+                                    lmb[e, 0]:lmb[e, 1],    #local_map的大小就是 (lmb[e, 0]:lmb[e, 1]) * (lmb[e, 2]:lmb[e, 3]), 也就是（gx2-gx1）* (gy2-gy1)
                                     lmb[e, 2]:lmb[e, 3]]
-            local_pose[e] = full_pose[e] - \
-                torch.from_numpy(origins[e]).to(device).float()
+            local_pose[e] = full_pose[e] - \                
+                torch.from_numpy(origins[e]).to(device).float()。#计算agent局部地图的坐标 （局部坐标 = 全局坐标 - 局部地图左上角在全局中的坐标）
 
-    def init_map_and_pose_for_env(e):
+    def init_map_and_pose_for_env(e):  #这个函数跟上面的函数相同，只不过是针对单环境（好处：可以被单独调用，比如在某个环境重置或失败后，只对这个环境重新初始化，而不影响其他环境。）
         full_map[e].fill_(0.)
         full_pose[e].fill_(0.)
         full_pose[e, :2] = args.map_size_cm / 100.0 / 2.0
@@ -196,30 +196,30 @@ def main():
         local_pose[e] = full_pose[e] - \
             torch.from_numpy(origins[e]).to(device).float()
 
-    def update_intrinsic_rew(e):
-        prev_explored_area = full_map[e, 1].sum(1).sum(0)
-        full_map[e, :, lmb[e, 0]:lmb[e, 1], lmb[e, 2]:lmb[e, 3]] = \
+    def update_intrinsic_rew(e): #强化学习中探索驱动策略的一种形式：探索了多少新区域，就给多少奖励（有助于agent主动探索环境）
+        prev_explored_area = full_map[e, 1].sum(1).sum(0)   #计算之前区域已经探索的面积 ### full_map[e, 1]：第 e 个环境的 full_map 的第 1 个通道，代表“已探索区域”  ### sum(1).sum(0)：先按行再按列求和，相当于对整个通道求总和（像素数量）
+        full_map[e, :, lmb[e, 0]:lmb[e, 1], lmb[e, 2]:lmb[e, 3]] = \   #把局部地图更新回全局地图中
             local_map[e]
-        curr_explored_area = full_map[e, 1].sum(1).sum(0)
-        intrinsic_rews[e] = curr_explored_area - prev_explored_area
-        intrinsic_rews[e] *= (args.map_resolution / 100.)**2  # to m^2
+        curr_explored_area = full_map[e, 1].sum(1).sum(0)        # 再次计算更新之后的已探索区域面积
+        intrinsic_rews[e] = curr_explored_area - prev_explored_area       # 这就是探索新区域的像素数，作为intrinsic reward
+        intrinsic_rews[e] *= (args.map_resolution / 100.)**2  # to m^2   # 把 reward 从单位“像素数”转换为“平方米”，跟实际物理世界相挂钩 ### args.map_resolution表示地图中的一格（一个像素）代表现实中的多少cm
 
     init_map_and_pose()
 
-    # Global policy observation space
-    ngc = 8 + args.num_sem_categories
+    # Global policy observation space。 #“观测张量”（observation tensor）是智能体每一步从环境中接收到的信息的集合 —— 通常是一个张量（多维数组）   比如图像类型的观测（channels, height, width）
+    ngc = 8 + args.num_sem_categories     
     es = 2
-    g_observation_space = gym.spaces.Box(0, 1,
-                                         (ngc,
+    g_observation_space = gym.spaces.Box(0, 1,     #gym.space.Box 是 OpenAI Gym 中的一个类，用来定义一个 连续数值空间 ### 用法上可以理解为Box(low, high, shape)：所有数值都在low到high之间，张量形状是shape, 数据类型是dtype
+                                         (ngc,      #这里是观测空间，这是典型的用于图像或语义地图的张量表示
                                           local_w,
-                                          local_h), dtype='uint8')
+                                          local_h), dtype='uint8') #dtype='uint8' 表示张量中的每个元素的数据类型是 无符号8位整数
 
-    # Global policy action space
-    g_action_space = gym.spaces.Box(low=0.0, high=0.99,
+    # Global policy action space 
+    g_action_space = gym.spaces.Box(low=0.0, high=0.99,  #这里是动作空间，这个动作代表“下一步想去的位置”的地图坐标
                                     shape=(2,), dtype=np.float32)
 
     # Global policy recurrent layer size
-    g_hidden_size = args.global_hidden_size
+    g_hidden_size = args.global_hidden_size    #把全局策略中RNN的隐藏层大小/维度（隐藏层中神经元的个数）赋值给变量 g_hidden_size  ##
 
     # Semantic Mapping
     sem_map_module = Semantic_Mapping(args).to(device)
