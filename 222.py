@@ -210,12 +210,12 @@ def main():
     ngc = 8 + args.num_sem_categories     
     es = 2
     g_observation_space = gym.spaces.Box(0, 1,     #gym.space.Box 是 OpenAI Gym 中的一个类，用来定义一个 连续数值空间 ### 用法上可以理解为Box(low, high, shape)：所有数值都在low到high之间，张量形状是shape, 数据类型是dtype
-                                         (ngc,      #这里是观测空间，这是典型的用于图像或语义地图的张量表示
+                                         (ngc,      #这个张量是一个多通道的局部语义地图图像
                                           local_w,
                                           local_h), dtype='uint8') #dtype='uint8' 表示张量中的每个元素的数据类型是 无符号8位整数
 
     # Global policy action space 
-    g_action_space = gym.spaces.Box(low=0.0, high=0.99,  #这里是动作空间，这个动作代表“下一步想去的位置”的地图坐标
+    g_action_space = gym.spaces.Box(low=0.0, high=0.99,  #这里是动作空间，这个动作代表“下一步想去的位置”的地图坐标 [0, 0.99]会映射成实际坐标
                                     shape=(2,), dtype=np.float32)
 
     # Global policy recurrent layer size
@@ -225,36 +225,69 @@ def main():
     sem_map_module = Semantic_Mapping(args).to(device) #创建一个语义地图构建器的实例，args 传入了参数（如类别数、分辨率等）
     sem_map_module.eval()  #进入评估模式
 
+
+    关于强化学习
+        强化学习（RL）是一个智能体（agent）在环境（environment）中“试错学习”的过程，它大致分为两个阶段：
+            1. 交互阶段（作用：收集经验）
+                action = g_agent.act(observation, ...)
+                g_agent.act(...) 就是让 agent 根据当前观测 observation 选出一个动作 action。
+		        然后这个动作会被送到环境中执行，环境会返回：
+		            新的观测 observation’
+		            奖励 reward
+		            是否结束 done
+		        这个过程会持续多步，直到收集够了一批“经验”。
+                这批经验的形式可以是这样一组数据：(observation, action, reward, next_observation, done)
+                我们称为 transition（转移）。多步的 transition 加起来就是一批经验。
+            2. 学习阶段（作用：更新策略）
+                g_agent.update(batch)
+                这一步使用上面收集的那一批经验（batch）来更新策略网络中的参数。
+                它本质上就是 用“表现好”的动作增加概率，差的减少概率。
+                PPO 算法用的是“剪切损失函数 + 值函数 + 熵正则”，这一切都封装在 g_agent.update() 里了。
+            也就是说：
+                act() 是“行动”，update() 是“学习”。
+    
     # Global policy
-    g_policy = RL_Policy(g_observation_space.shape, g_action_space,
-                         model_type=1,
-                         base_kwargs={'recurrent': args.use_recurrent_global,
-                                      'hidden_size': g_hidden_size,
-                                      'num_sem_categories': ngc - 8
+    #g_poicy这一行会构建一个用于全局导航策略的神经网络模型，它的输入是局部语义地图，输出是一个动作
+    g_policy = RL_Policy(g_observation_space.shape, # 输入空间形状，例如 (channel, height, width)
+                         g_action_space,    # 动作空间，前面定义为 Box(2,)
+                         model_type=1,    # 模型类型：通常控制网络结构的选择 这里暂时不用去管
+                         base_kwargs={'recurrent': args.use_recurrent_global, # 是否使用RNN（LSTM/GRU）
+                                      'hidden_size': g_hidden_size,       # 隐藏层神经元数
+                                      'num_sem_categories': ngc - 8    # 语义类别数（减去基础通道）
                                       }).to(device)
-    g_agent = algo.PPO(g_policy, args.clip_param, args.ppo_epoch,
-                       args.num_mini_batch, args.value_loss_coef,
-                       args.entropy_coef, lr=args.lr, eps=args.eps,
+    g_agent = algo.PPO(g_policy,    #用PPO算法初始化一个“智能体”对象g_agent，它包含一个策略网络 (g_policy)和value网络 (值函数)，包含优化器（用于调参） ### 可以执行g_agent.act(), g_agent.update()等动作 
+                       args.clip_param, 
+                       args.ppo_epoch,
+                       args.num_mini_batch, 
+                       args.value_loss_coef,
+                       args.entropy_coef, 
+                       lr=args.lr, 
+                       eps=args.eps,
                        max_grad_norm=args.max_grad_norm)
 
-    global_input = torch.zeros(num_scenes, ngc, local_w, local_h)
-    global_orientation = torch.zeros(num_scenes, 1).long()
-    intrinsic_rews = torch.zeros(num_scenes).to(device)
-    extras = torch.zeros(num_scenes, 2)
+    global_input = torch.zeros(num_scenes, ngc, local_w, local_h) #创建一个张量，这是全局策略网络（g_policy / global policy）的观测输入，语义地图格式的图像张量. 它不直接观测RGB图像，而是使用的是语义地图这种空间结构的数据表示
+    global_orientation = torch.zeros(num_scenes, 1).long() #表示每个环境中agent的朝向，用一个整数（通常代表角度的理想值来存储）
+    intrinsic_rews = torch.zeros(num_scenes).to(device) #每个环境当前时间步的内在奖励（intrinsic reward），比如鼓励探索新区域就是内在奖励，而外在奖励是完成某种任务给予的（比如说到达目标、吃掉豆子、打败敌人）
+    extras = torch.zeros(num_scenes, 2) #这个张量一般用于存储一些额外信息
 
-    # Storage
-    g_rollouts = GlobalRolloutStorage(args.num_global_steps,
-                                      num_scenes, g_observation_space.shape,
-                                      g_action_space, g_policy.rec_state_size,
-                                      es).to(device)
+    # Storage 
+    # 这个是初始化全局策略的经验存储器。 ###经验存储器（rollout buffer）是在强化学习中用来 临时保存智能体与环境交互过程中的数据，以便后续执行策略更新
+    # 在PPO中，智能体会与环境交互一段时间（比如128个时间步），每一步都存以下内容：当前观测（state）, 当前动作（action）, 得到的奖励（reward）, 策略的概率输出（log prob）, 值函数预测的 value, RNN 的隐藏状态（如果用了 RNN）
+    g_rollouts = GlobalRolloutStorage(args.num_global_steps, #每个rollout的时间步数，rollout时间步数是指你希望智能体在更新策略之前，与环境交互多少步
+                                      num_scenes, # 并行环境数
+                                      g_observation_space.shape, #观测张量形状 (ngc, local_w, local_h)
+                                      g_action_space, g_policy.rec_state_size, #动作空间
+                                      es).to(device) #extras 的维度（一般是2维）
+    #如果设置了加载预训练模型，则载入参数 
+    ###  一个“模型”通常指的是一个神经网络，它有很多参数（也就是权重和偏置）
+    ###  “预训练模型”就是：一个已经在某个任务或数据上训练过，保存下来的模型参数文件，你可以拿来“加载”继续使用或微调，而不是从头开始训练。
+    if args.load != "0": #如果传入的参数 args.load 不是字符串 "0"，说明用户提供了一个模型文件的路径
+        print("Loading model {}".format(args.load)) #torch.load(...) 读取这个文件，获得里面保存的参数（通常是字典形式）。
+        state_dict = torch.load(args.load, 
+                                map_location=lambda storage, loc: storage)  #torch.load(...) 读取这个文件，获得里面保存的参数（通常是字典形式）。
+        g_policy.load_state_dict(state_dict) #load_state_dict(...) 把这些参数“加载”到你的策略网络 g_policy 中。
 
-    if args.load != "0":
-        print("Loading model {}".format(args.load))
-        state_dict = torch.load(args.load,
-                                map_location=lambda storage, loc: storage)
-        g_policy.load_state_dict(state_dict)
-
-    if args.eval:
+    if args.eval:  #如果是评估模式（禁用dropout 和 batchnorm 的训练行为）
         g_policy.eval()
 
     # Predict semantic map from frame 1
