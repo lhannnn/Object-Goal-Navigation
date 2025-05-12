@@ -291,80 +291,81 @@ def main():
         g_policy.eval()
 
     # Predict semantic map from frame 1
-    poses = torch.from_numpy(np.asarray(
-        [infos[env_idx]['sensor_pose'] for env_idx in range(num_scenes)])
-    ).float().to(device)
+    poses = torch.from_numpy(np.asarray( #从每个并行环境中提取当前的 agent 位姿信息  ### np.asarray(...)是将Python 列表转为 NumPy 数组，得到一个 (num_scenes, 3) 的数组  # .from_numpy把Numpy数组转化为tensor
+        [infos[env_idx]['sensor_pose'] for env_idx in range(num_scenes)]) #infos 是一个列表或字典，记录了每个环境（env_idx）当前 timestep 的一些信息（比如位置、目标类别等）
+    ).float().to(device) #
 
-    _, local_map, _, local_pose = \
-        sem_map_module(obs, poses, local_map, local_pose)
+    _, local_map, _, local_pose = \    #构建/更新了 agent 的局部语义地图和局部位姿估计。 比如说初始位置是看到了什么，把东西放到地图里
+        sem_map_module(obs, poses, local_map, local_pose) #obs: 当前时间步中 agent 的 RGB-D 图像观测 #poses: 每个环境中 agent 的当前位姿 #local_map: 当前的局部语义地图（上一帧） #当前的局部位姿（上一帧）
 
     # Compute Global policy input
     locs = local_pose.cpu().numpy()
-    global_input = torch.zeros(num_scenes, ngc, local_w, local_h)
+    global_input = torch.zeros(num_scenes, ngc, local_w, local_h)  #上面已经定义过了，这里又定义了一次？而且中间也没有对global_input和global_orientation的更改？
     global_orientation = torch.zeros(num_scenes, 1).long()
 
     for e in range(num_scenes):
         r, c = locs[e, 1], locs[e, 0]
-        loc_r, loc_c = [int(r * 100.0 / args.map_resolution),
-                        int(c * 100.0 / args.map_resolution)]
+        loc_r, loc_c = [int(r * 100.0 / args.map_resolution), 
+                        int(c * 100.0 / args.map_resolution)] 
 
-        local_map[e, 2:4, loc_r - 1:loc_r + 2, loc_c - 1:loc_c + 2] = 1.
-        global_orientation[e] = int((locs[e, 2] + 180.0) / 5.)
+        local_map[e, 2:4, loc_r - 1:loc_r + 2, loc_c - 1:loc_c + 2] = 1. #前面是在full_map上标记，现在是在local_map上标记
+        global_orientation[e] = int((locs[e, 2] + 180.0) / 5.) #将角度（-180° 到 180°）变成 0 到 71 的整数（360° / 5 = 72 个离散方向）
 
-    global_input[:, 0:4, :, :] = local_map[:, 0:4, :, :].detach()
-    global_input[:, 4:8, :, :] = nn.MaxPool2d(args.global_downscaling)(
+    global_input[:, 0:4, :, :] = local_map[:, 0:4, :, :].detach()       #局部语义地图 full_map 的前 4 个通道  ### .detach() 是避免梯度传播，因为地图不是网络要训练的参数
+    global_input[:, 4:8, :, :] = nn.MaxPool2d(args.global_downscaling)(     #把局部语义地图 full_map 的前 4 个通道下采样
         full_map[:, 0:4, :, :])
-    global_input[:, 8:, :, :] = local_map[:, 4:, :, :].detach()
-    goal_cat_id = torch.from_numpy(np.asarray(
+    global_input[:, 8:, :, :] = local_map[:, 4:, :, :].detach()     #剩下别的语义通道
+    goal_cat_id = torch.from_numpy(np.asarray(        #提取每个环境当前的目标类别（如“椅子”、“冰箱”）用整数表示，goal_cat_id的shape为(num_scenes,)
         [infos[env_idx]['goal_cat_id'] for env_idx
          in range(num_scenes)]))
 
-    extras = torch.zeros(num_scenes, 2)
+    extras = torch.zeros(num_scenes, 2)    #拼成一个 extras 张量，作为额外信息传给策略网络：[朝向，目标类别]
     extras[:, 0] = global_orientation[:, 0]
     extras[:, 1] = goal_cat_id
 
-    g_rollouts.obs[0].copy_(global_input)
+    g_rollouts.obs[0].copy_(global_input)  #将初始化好的 global_input 和 extras 存入 GlobalRolloutStorage 的第 0 步。  这样策略网络在第 1 步就能用这些输入做动作选择。
     g_rollouts.extras[0].copy_(extras)
 
     # Run Global Policy (global_goals = Long-Term Goal)
-    g_value, g_action, g_action_log_prob, g_rec_states = \
-        g_policy.act(
-            g_rollouts.obs[0],
-            g_rollouts.rec_states[0],
-            g_rollouts.masks[0],
-            extras=g_rollouts.extras[0],
-            deterministic=False
+    g_value, g_action, g_action_log_prob, g_rec_states = \。#g_value当前状态的值函数估计 g_action全局策略网络的输出的动作，形状为（num_scenes,2）但数值在[0,1)区间 #g_action_log_prob 输出动作的log概率，用于PPO算法计算loss
+        g_policy.act(                    #g_rec_states RNN的下一个隐藏状态，存到下一timestep用
+            g_rollouts.obs[0],  #当前timestep的输入语义图（多通道）
+            g_rollouts.rec_states[0], #RNN的历史隐藏状态（用来保存记忆）
+            g_rollouts.masks[0], #
+            extras=g_rollouts.extras[0], #额外输入，包括朝向和物理类别ID
+            deterministic=False #
         )
 
-    cpu_actions = nn.Sigmoid()(g_action).cpu().numpy()
-    global_goals = [[int(action[0] * local_w), int(action[1] * local_h)]
+    cpu_actions = nn.Sigmoid()(g_action).cpu().numpy() #全局策略网络输出的 g_action 可能是未经归一化的值，所以通过 Sigmoid() 将其压缩到 (0, 1) 区间
+    global_goals = [[int(action[0] * local_w), int(action[1] * local_h)]   #把归一化地图坐标转化为地图坐标
                     for action in cpu_actions]
-    global_goals = [[min(x, int(local_w - 1)), min(y, int(local_h - 1))]
-                    for x, y in global_goals]
+    global_goals = [[min(x, int(local_w - 1)), min(y, int(local_h - 1))]   #确保目标坐标不会越界（坐标最大为地图边界）
+                    for x, y in global_goals]        
 
-    goal_maps = [np.zeros((local_w, local_h)) for _ in range(num_scenes)]
+    goal_maps = [np.zeros((local_w, local_h)) for _ in range(num_scenes)]  #创建一张大小为（local_w, local_h）的空白地图
 
     for e in range(num_scenes):
-        goal_maps[e][global_goals[e][0], global_goals[e][1]] = 1
+        goal_maps[e][global_goals[e][0], global_goals[e][1]] = 1 #把目标点标记到地图上
 
-    planner_inputs = [{} for e in range(num_scenes)]
-    for e, p_input in enumerate(planner_inputs):
-        p_input['map_pred'] = local_map[e, 0, :, :].cpu().numpy()
-        p_input['exp_pred'] = local_map[e, 1, :, :].cpu().numpy()
-        p_input['pose_pred'] = planner_pose_inputs[e]
+    planner_inputs = [{} for e in range(num_scenes)] #为每个并行环境初始化一个空字典，后面要往里面填导航器需要的信息 ### planner_inputs 是一个列表，里面每一项是一个字典
+    for e, p_input in enumerate(planner_inputs):  #
+        p_input['map_pred'] = local_map[e, 0, :, :].cpu().numpy() #存入第0个通道（Obstacle Map）
+        p_input['exp_pred'] = local_map[e, 1, :, :].cpu().numpy() #存入第1个通道（explored area）
+        p_input['pose_pred'] = planner_pose_inputs[e] #planner_pose_input的上面shape为（num_scenes, 7）的张量
         p_input['goal'] = goal_maps[e]  # global_goals[e]
-        p_input['new_goal'] = 1
-        p_input['found_goal'] = 0
-        p_input['wait'] = wait_env[e] or finished[e]
+        p_input['new_goal'] = 1  #1 表示刚刚设置的新目标点。
+        p_input['found_goal'] = 0 #0 表示当前还未到达目标物体
+        p_input['wait'] = wait_env[e] or finished[e] #如果当前环境被标记为 wait 或已经结束，则在这一时刻让 agent 停止规划行为
         if args.visualize or args.print_images:
             local_map[e, -1, :, :] = 1e-5
             p_input['sem_map_pred'] = local_map[e, 4:, :, :
                                                 ].argmax(0).cpu().numpy()
 
-    obs, _, done, infos = envs.plan_act_and_preprocess(planner_inputs)
-
-    start = time.time()
-    g_reward = 0
+    obs, _, done, infos = envs.plan_act_and_preprocess(planner_inputs) #调用了环境的 plan_act_and_preprocess 方法，让 agent 根据前面设置的目标，执行一次决策动作并返回反馈。
+                                                       #planner_inputs是我们上一轮准备的目标和地图，现在 agent 根据它来采取实际动作，然后环境给出反馈
+						      #done是一个布尔列表，表示哪些环境已经完成（即 episode 结束）。
+    start = time.time() #获取当前时间，用于之后计算某段代码执行时间（profiling 用）。
+    g_reward = 0 #初始化全局奖励计数器，后面可以记录该时间步下所有 agent 的总奖励
 
     torch.set_grad_enabled(False)
     spl_per_category = defaultdict(list)
