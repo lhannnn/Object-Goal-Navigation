@@ -158,7 +158,7 @@ def main():
 
             lmb[e] = get_local_map_boundaries((loc_r, loc_c),      #lmb记录的就是gx1, gx2, gy1, gy2
                                               (local_w, local_h),
-                                              (full_w, full_h))
+                                              (full_w, full_h))    #local_w和local_h就是要裁减出来的地图的大小（局部地图） #### full_w和full_h没啥用就是判断有没有溢出的
 
             planner_pose_inputs[e, 3:] = lmb[e]
             origins[e] = [lmb[e][2] * args.map_resolution / 100.0,           #把局部地图的左上角设置为原点 （这张局部地图是以agent为中心裁的）
@@ -308,11 +308,11 @@ def main():
         loc_r, loc_c = [int(r * 100.0 / args.map_resolution), 
                         int(c * 100.0 / args.map_resolution)] 
 
-        local_map[e, 2:4, loc_r - 1:loc_r + 2, loc_c - 1:loc_c + 2] = 1. #前面是在full_map上标记，现在是在local_map上标记
+        local_map[e, 2:4, loc_r - 1:loc_r + 2, loc_c - 1:loc_c + 2] = 1. #前面是在full_map上标记，现在是在local_map中的current location和explored area上标记一个3*3的位置
         global_orientation[e] = int((locs[e, 2] + 180.0) / 5.) #将角度（-180° 到 180°）变成 0 到 71 的整数（360° / 5 = 72 个离散方向）
 
-    global_input[:, 0:4, :, :] = local_map[:, 0:4, :, :].detach()       #局部语义地图 full_map 的前 4 个通道  ### .detach() 是避免梯度传播，因为地图不是网络要训练的参数
-    global_input[:, 4:8, :, :] = nn.MaxPool2d(args.global_downscaling)(     #把局部语义地图 full_map 的前 4 个通道下采样
+    global_input[:, 0:4, :, :] = local_map[:, 0:4, :, :].detach()       #局部语义地图 local_map 的前 4 个通道  ### .detach() 是避免梯度传播，因为地图不是网络要训练的参数
+    global_input[:, 4:8, :, :] = nn.MaxPool2d(args.global_downscaling)(     #把全局语义地图 full_map 的前 4 个通道下采样
         full_map[:, 0:4, :, :])
     global_input[:, 8:, :, :] = local_map[:, 4:, :, :].detach()     #剩下别的语义通道
     goal_cat_id = torch.from_numpy(np.asarray(        #提取每个环境当前的目标类别（如“椅子”、“冰箱”）用整数表示，goal_cat_id的shape为(num_scenes,)
@@ -327,36 +327,36 @@ def main():
     g_rollouts.extras[0].copy_(extras)
 
     # Run Global Policy (global_goals = Long-Term Goal)
-    g_value, g_action, g_action_log_prob, g_rec_states = \。#g_value当前状态的值函数估计 g_action全局策略网络的输出的动作，形状为（num_scenes,2）但数值在[0,1)区间 #g_action_log_prob 输出动作的log概率，用于PPO算法计算loss
+    g_value, g_action, g_action_log_prob, g_rec_states = \ #g_value当前状态的值函数估计 g_action全局策略网络的输出的动作，形状为（num_scenes,2）但数值在[0,1)区间 #g_action_log_prob 输出动作的log概率，用于PPO算法计算loss
         g_policy.act(                    #g_rec_states RNN的下一个隐藏状态，存到下一timestep用
-            g_rollouts.obs[0],  #当前timestep的输入语义图（多通道）
-            g_rollouts.rec_states[0], #RNN的历史隐藏状态（用来保存记忆）
+            g_rollouts.obs[0],  #当前观测（语义图）
+            g_rollouts.rec_states[0], #上一时刻RNN的隐藏状态
             g_rollouts.masks[0], #
-            extras=g_rollouts.extras[0], #额外输入，包括朝向和物理类别ID
-            deterministic=False #
+            extras=g_rollouts.extras[0], #额外输入（朝向和物体类别）
+            deterministic=False #是否使用确定性策略  True:用于选择概率最大的动作（用于测试）  False:按动作概率分布随机采样动作（用于训练）
         )
 
-    cpu_actions = nn.Sigmoid()(g_action).cpu().numpy() #全局策略网络输出的 g_action 可能是未经归一化的值，所以通过 Sigmoid() 将其压缩到 (0, 1) 区间
-    global_goals = [[int(action[0] * local_w), int(action[1] * local_h)]   #把归一化地图坐标转化为地图坐标
+    cpu_actions = nn.Sigmoid()(g_action).cpu().numpy() #全局策略网络输出的 g_action 可能是未经归一化的值，所以通过 Sigmoid() 将其压缩到 (0, 1) 区间，cpu_actions的shape是（num_scenes,[,]）
+    global_goals = [[int(action[0] * local_w), int(action[1] * local_h)]   #把归一化地图坐标转化为地图坐标（格数）
                     for action in cpu_actions]
     global_goals = [[min(x, int(local_w - 1)), min(y, int(local_h - 1))]   #确保目标坐标不会越界（坐标最大为地图边界）
                     for x, y in global_goals]        
 
-    goal_maps = [np.zeros((local_w, local_h)) for _ in range(num_scenes)]  #创建一张大小为（local_w, local_h）的空白地图
+    goal_maps = [np.zeros((local_w, local_h)) for _ in range(num_scenes)]  #创建num_scenes张大小为（local_w, local_h）的空白地图
 
     for e in range(num_scenes):
         goal_maps[e][global_goals[e][0], global_goals[e][1]] = 1 #把目标点标记到地图上
 
     planner_inputs = [{} for e in range(num_scenes)] #为每个并行环境初始化一个空字典，后面要往里面填导航器需要的信息 ### planner_inputs 是一个列表，里面每一项是一个字典
-    for e, p_input in enumerate(planner_inputs):  #
+    for e, p_input in enumerate(planner_inputs):  #enumerate 是 Python 内置函数，它返回的是 (索引, 元素) 的元组。
         p_input['map_pred'] = local_map[e, 0, :, :].cpu().numpy() #存入第0个通道（Obstacle Map）
         p_input['exp_pred'] = local_map[e, 1, :, :].cpu().numpy() #存入第1个通道（explored area）
         p_input['pose_pred'] = planner_pose_inputs[e] #planner_pose_input的上面shape为（num_scenes, 7）的张量
         p_input['goal'] = goal_maps[e]  # global_goals[e]
         p_input['new_goal'] = 1  #1 表示刚刚设置的新目标点。
         p_input['found_goal'] = 0 #0 表示当前还未到达目标物体
-        p_input['wait'] = wait_env[e] or finished[e] #如果当前环境被标记为 wait 或已经结束，则在这一时刻让 agent 停止规划行为
-        if args.visualize or args.print_images:
+        p_input['wait'] = wait_env[e] or finished[e] #如果当前环境被标记为 wait 或 finished，则在这一时刻让 agent 停止规划行为
+        if args.visualize or args.print_images:   #如果启动了可视化（可选）
             local_map[e, -1, :, :] = 1e-5
             p_input['sem_map_pred'] = local_map[e, 4:, :, :
                                                 ].argmax(0).cpu().numpy()
@@ -368,28 +368,29 @@ def main():
     g_reward = 0 #初始化全局奖励计数器，后面可以记录该时间步下所有 agent 的总奖励
 
     torch.set_grad_enabled(False)
-    spl_per_category = defaultdict(list)
-    success_per_category = defaultdict(list)
+    spl_per_category = defaultdict(list) #spl_per_category是一个字典，它的每一个键对应的值是一个列表。 如'chair': [0.85, 0.82]
+    success_per_category = defaultdict(list) #defaultdict是一个字典的子类，当你访问一个还没有的键（key）时，它会自动创建并赋一个默认值，而不是抛出 KeyError
+	#defaultdict是一个字典的子类 但当访问一个 不存在的键 时，它会自动创建一个默认值，这里是一个空的 list，可以直接spl_per_category[1].append(0.8)  # 导航到椅子，SPL=0.8
 
-    for step in range(args.num_training_frames // args.num_processes + 1):
+    for step in range(args.num_training_frames // args.num_processes + 1): #总共训练 args.num_training_frames 个时间步（frame）除以环境（num_processes）的数量
         if finished.sum() == args.num_processes:
             break
 
-        g_step = (step // args.num_local_steps) % args.num_global_steps
-        l_step = step % args.num_local_steps
+        g_step = (step // args.num_local_steps) % args.num_global_steps # step // args.num_local_steps 代表当前处于第几次 rollout ### 同时 %args.num_global_steps 是因为rollout buffer只存储后args.num_global_steps个rollout
+        l_step = step % args.num_local_steps    #表示在当前收集的这轮rollout (局部收集的一批轨迹)中，这是第几步
 
         # ------------------------------------------------------------------
         # Reinitialize variables when episode ends
-        l_masks = torch.FloatTensor([0 if x else 1
-                                     for x in done]).to(device)
+        l_masks = torch.FloatTensor([0 if x else 1     #构造 l_masks，规则是：如果该环境结束了（done=True），就设为 0；否则设为 1。
+                                     for x in done]).to(device)  #l_masks是一个张量，形状是(num_processes,) 告诉环境是否结束
         g_masks *= l_masks
 
         for e, x in enumerate(done):
-            if x:
+            if x:  #如果这个episode 结束了
                 spl = infos[e]['spl']
                 success = infos[e]['success']
                 dist = infos[e]['distance_to_goal']
-                spl_per_category[infos[e]['goal_name']].append(spl)
+                spl_per_category[infos[e]['goal_name']].append(spl)   
                 success_per_category[infos[e]['goal_name']].append(success)
                 if args.eval:
                     episode_success[e].append(success)
@@ -401,9 +402,9 @@ def main():
                     episode_success.append(success)
                     episode_spl.append(spl)
                     episode_dist.append(dist)
-                wait_env[e] = 1.
-                update_intrinsic_rew(e)
-                init_map_and_pose_for_env(e)
+                wait_env[e] = 1.  #标记该环境为 wait，表示它暂时处于“等待重置”的状态。
+                update_intrinsic_rew(e) #更新当前环境的内部奖励
+                init_map_and_pose_for_env(e) #重新初始化当前环境的地图和位姿，即重新开始新的episode
         # ------------------------------------------------------------------
 
         # ------------------------------------------------------------------
@@ -411,13 +412,13 @@ def main():
         poses = torch.from_numpy(np.asarray(
             [infos[env_idx]['sensor_pose'] for env_idx
              in range(num_scenes)])
-        ).float().to(device)
+        ).float().to(device) 
 
         _, local_map, _, local_pose = \
             sem_map_module(obs, poses, local_map, local_pose)
 
         locs = local_pose.cpu().numpy()
-        planner_pose_inputs[:, :3] = locs + origins
+        planner_pose_inputs[:, :3] = locs + origins #将agent从局部地图的位置转化为全局地图的位置
         local_map[:, 2, :, :].fill_(0.)  # Resetting current location channel
         for e in range(num_scenes):
             r, c = locs[e, 1], locs[e, 0]
@@ -429,17 +430,17 @@ def main():
 
         # ------------------------------------------------------------------
         # Global Policy
-        if l_step == args.num_local_steps - 1:
+        if l_step == args.num_local_steps - 1: #一个全局步（global step）完成，也就是说 local policy 执行完一次周期（例如25步）
             # For every global step, update the full and local maps
             for e in range(num_scenes):
-                if wait_env[e] == 1:  # New episode
-                    wait_env[e] = 0.
+                if wait_env[e] == 1:  # New episode # 表示新 episode 开始
+                    wait_env[e] = 0.  #就不更新奖励
                 else:
-                    update_intrinsic_rew(e)
+                    update_intrinsic_rew(e) #否则更新内部奖励
 
-                full_map[e, :, lmb[e, 0]:lmb[e, 1], lmb[e, 2]:lmb[e, 3]] = \
+                full_map[e, :, lmb[e, 0]:lmb[e, 1], lmb[e, 2]:lmb[e, 3]] = \   #更新全局地图
                     local_map[e]
-                full_pose[e] = local_pose[e] + \
+                full_pose[e] = local_pose[e] + \         #更新全局位姿
                     torch.from_numpy(origins[e]).to(device).float()
 
                 locs = full_pose[e].cpu().numpy()
@@ -447,26 +448,26 @@ def main():
                 loc_r, loc_c = [int(r * 100.0 / args.map_resolution),
                                 int(c * 100.0 / args.map_resolution)]
 
-                lmb[e] = get_local_map_boundaries((loc_r, loc_c),
+                lmb[e] = get_local_map_boundaries((loc_r, loc_c),       #计算局部地图的边界
                                                   (local_w, local_h),
                                                   (full_w, full_h))
 
-                planner_pose_inputs[e, 3:] = lmb[e]
-                origins[e] = [lmb[e][2] * args.map_resolution / 100.0,
+                planner_pose_inputs[e, 3:] = lmb[e]     #更新planner_pose_inputs
+                origins[e] = [lmb[e][2] * args.map_resolution / 100.0,               #把局部地图的左上角设置为原点
                               lmb[e][0] * args.map_resolution / 100.0, 0.]
 
-                local_map[e] = full_map[e, :,
+                local_map[e] = full_map[e, :,                #重新从全局地图里得到局部地图
                                         lmb[e, 0]:lmb[e, 1],
                                         lmb[e, 2]:lmb[e, 3]]
-                local_pose[e] = full_pose[e] - \
+                local_pose[e] = full_pose[e] - \              #计算局部位姿
                     torch.from_numpy(origins[e]).to(device).float()
 
             locs = local_pose.cpu().numpy()
             for e in range(num_scenes):
-                global_orientation[e] = int((locs[e, 2] + 180.0) / 5.)
-            global_input[:, 0:4, :, :] = local_map[:, 0:4, :, :]
+                global_orientation[e] = int((locs[e, 2] + 180.0) / 5.)   #计算每个scene的角度
+            global_input[:, 0:4, :, :] = local_map[:, 0:4, :, :]    # 局部语义地图 local_map 的前 4 个通道  
             global_input[:, 4:8, :, :] = \
-                nn.MaxPool2d(args.global_downscaling)(
+                nn.MaxPool2d(args.global_downscaling)(            #把全局语义地图full_map的前4个通道下采样
                     full_map[:, 0:4, :, :])
             global_input[:, 8:, :, :] = local_map[:, 4:, :, :].detach()
             goal_cat_id = torch.from_numpy(np.asarray(
@@ -476,38 +477,38 @@ def main():
             extras[:, 1] = goal_cat_id
 
             # Get exploration reward and metrics
-            g_reward = torch.from_numpy(np.asarray(
+            g_reward = torch.from_numpy(np.asarray(      #提取每个环境中当前时间步的 全局奖励（g_reward）（严谨来说的话，其实是当前时间步所采取的动作获得的全局奖励）
                 [infos[env_idx]['g_reward'] for env_idx in range(num_scenes)])
             ).float().to(device)
-            g_reward += args.intrinsic_rew_coeff * intrinsic_rews.detach()
+            g_reward += args.intrinsic_rew_coeff * intrinsic_rews.detach()    #在强化学习中，intrinsic reward（内部奖励）是一种“激励 agent 自我驱动去探索”的奖励，不依赖于任务目标是否完成，而是基于探索行为本身来提供反馈。
+  #args.intrinsic_rew_coeff 是一个系数，控制内部奖励对总奖励的影响。   ###  intrinsic_rews 是表示 agent 是否进入了新区域（鼓励探索）的奖励
+            g_process_rewards += g_reward.cpu().numpy()    #累加全局奖励
+            g_total_rewards = g_process_rewards * \      #检查哪些环境的 episode 结束了，并提取其 最终累计奖励。
+                (1 - g_masks.cpu().numpy())          #g_masks 是一个形状为 (num_scenes,) 的张量，0 表示 episode 结束，1 表示还在进行
+            g_process_rewards *= g_masks.cpu().numpy()   #重置那些已经结束 episode 的环境的累计奖励。
+            per_step_g_rewards.append(np.mean(g_reward.cpu().numpy()))      #这里取平均是把当前时间步下，所有scene的全局奖励取平均
 
-            g_process_rewards += g_reward.cpu().numpy()
-            g_total_rewards = g_process_rewards * \
-                (1 - g_masks.cpu().numpy())
-            g_process_rewards *= g_masks.cpu().numpy()
-            per_step_g_rewards.append(np.mean(g_reward.cpu().numpy()))
-
-            if np.sum(g_total_rewards) != 0:
+            if np.sum(g_total_rewards) != 0:     #检查当前这个时间步，是否有 任何一个场景 的 episode 结束了
                 for total_rew in g_total_rewards:
                     if total_rew != 0:
-                        g_episode_rewards.append(total_rew)
+                        g_episode_rewards.append(total_rew) #把该场景的 episode 总奖励加入到 g_episode_rewards 这个列表中
 
             # Add samples to global policy storage
-            if step == 0:
+            if step == 0:   #如果是当前episode 的第一个时间步，将当前的全局输入 global_input 和 extras 存入 g_rollouts 的第 0 个位置
                 g_rollouts.obs[0].copy_(global_input)
                 g_rollouts.extras[0].copy_(extras)
             else:
-                g_rollouts.insert(
+                g_rollouts.insert(    #否则就将本时间步的全部信息插入 g_rollouts 的当前位置
                     global_input, g_rec_states,
                     g_action, g_action_log_prob, g_value,
                     g_reward, g_masks, extras
                 )
 
             # Sample long-term goal from global policy
-            g_value, g_action, g_action_log_prob, g_rec_states = \
-                g_policy.act(
-                    g_rollouts.obs[g_step + 1],
-                    g_rollouts.rec_states[g_step + 1],
+            g_value, g_action, g_action_log_prob, g_rec_states = \    #这里调用的是 全局策略网络 g_policy 的 act() 方法，它的作用是给出一个“长期目标动作”（global goal）。
+                g_policy.act(                                 #也就是确定一个长期目标
+                    g_rollouts.obs[g_step + 1],     #g_rollouts.obs[g_step + 1] 实际上 就代表当前状态，只是它在 rollout 数据结构里被预先插入到了 g_step + 1 的位置
+                    g_rollouts.rec_states[g_step + 1], 
                     g_rollouts.masks[g_step + 1],
                     extras=g_rollouts.extras[g_step + 1],
                     deterministic=False
@@ -527,18 +528,18 @@ def main():
 
         # ------------------------------------------------------------------
         # Update long-term goal if target object is found
-        found_goal = [0 for _ in range(num_scenes)]
+        found_goal = [0 for _ in range(num_scenes)]    # 这段代码的作用是：检查 agent 是否在当前局部地图中找到了目标物体，如果找到了就用目标物体的精确位置替换原来的全局目标点。
         goal_maps = [np.zeros((local_w, local_h)) for _ in range(num_scenes)]
 
         for e in range(num_scenes):
-            goal_maps[e][global_goals[e][0], global_goals[e][1]] = 1
+            goal_maps[e][global_goals[e][0], global_goals[e][1]] = 1     #上面计算出默认的目标点（长期目标点）（如果后续发现了物体就替换）
 
-        for e in range(num_scenes):
-            cn = infos[e]['goal_cat_id'] + 4
-            if local_map[e, cn, :, :].sum() != 0.:
+        for e in range(num_scenes):  
+            cn = infos[e]['goal_cat_id'] + 4    #该目标类别的编号，因为最开始还有4个通道，所以目标类别的编号被顺延了
+            if local_map[e, cn, :, :].sum() != 0.:       
                 cat_semantic_map = local_map[e, cn, :, :].cpu().numpy()
                 cat_semantic_scores = cat_semantic_map
-                cat_semantic_scores[cat_semantic_scores > 0] = 1.
+                cat_semantic_scores[cat_semantic_scores > 0] = 1.    #把检测到的目标物体区域（不为0的区域）设置为 1
                 goal_maps[e] = cat_semantic_scores
                 found_goal[e] = 1
         # ------------------------------------------------------------------
@@ -547,35 +548,35 @@ def main():
         # Take action and get next observation
         planner_inputs = [{} for e in range(num_scenes)]
         for e, p_input in enumerate(planner_inputs):
-            p_input['map_pred'] = local_map[e, 0, :, :].cpu().numpy()
-            p_input['exp_pred'] = local_map[e, 1, :, :].cpu().numpy()
-            p_input['pose_pred'] = planner_pose_inputs[e]
+            p_input['map_pred'] = local_map[e, 0, :, :].cpu().numpy()   #输入当前局部地图的 障碍物通道（第0通道）。
+            p_input['exp_pred'] = local_map[e, 1, :, :].cpu().numpy()   #输入当前局部地图的 探索区域通道（第1通道）。
+            p_input['pose_pred'] = planner_pose_inputs[e]      #当前agent的位姿信息
             p_input['goal'] = goal_maps[e]  # global_goals[e]
-            p_input['new_goal'] = l_step == args.num_local_steps - 1
+            p_input['new_goal'] = l_step == args.num_local_steps - 1  #判断：当前是否处于一个局部 episode（local episode）的最后一个时间步（timestep）。是的话就赋值1，否则赋值0
             p_input['found_goal'] = found_goal[e]
             p_input['wait'] = wait_env[e] or finished[e]
-            if args.visualize or args.print_images:
+            if args.visualize or args.print_images:   #调试时的可视化信息（可忽略）
                 local_map[e, -1, :, :] = 1e-5
                 p_input['sem_map_pred'] = local_map[e, 4:, :,
                                                     :].argmax(0).cpu().numpy()
 
-        obs, _, done, infos = envs.plan_act_and_preprocess(planner_inputs)
+        obs, _, done, infos = envs.plan_act_and_preprocess(planner_inputs) #执行动作、返回观测值等
         # ------------------------------------------------------------------
 
         # ------------------------------------------------------------------
         # Training
         torch.set_grad_enabled(True)
         if g_step % args.num_global_steps == args.num_global_steps - 1 \
-                and l_step == args.num_local_steps - 1:
-            if not args.eval:
-                g_next_value = g_policy.get_value(
+                and l_step == args.num_local_steps - 1:        #如果当前时全局决策周期的最后一个全局步，并且是局部规划周期的最后一步
+            if not args.eval:  #如果不是评估模式，就开始训练：
+                g_next_value = g_policy.get_value(    #计算V值
                     g_rollouts.obs[-1],
                     g_rollouts.rec_states[-1],
                     g_rollouts.masks[-1],
                     extras=g_rollouts.extras[-1]
                 ).detach()
 
-                g_rollouts.compute_returns(g_next_value, args.use_gae,
+                g_rollouts.compute_returns(g_next_value, args.use_gae,   #计算return
                                            args.gamma, args.tau)
                 g_value_loss, g_action_loss, g_dist_entropy = \
                     g_agent.update(g_rollouts)
@@ -681,7 +682,7 @@ def main():
     # Print and save model performance numbers during evaluation
     if args.eval:
         print("Dumping eval details...")
-        
+         
         total_success = []
         total_spl = []
         total_dist = []
